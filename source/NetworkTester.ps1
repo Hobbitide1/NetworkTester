@@ -1,204 +1,245 @@
-# Clear screen and show instructions
-Clear-Host
-Write-Host "=====================================================" -ForegroundColor Cyan
-Write-Host "           NETWORK DIAGNOSTIC TOOL                   " -ForegroundColor Cyan
-Write-Host "=====================================================" -ForegroundColor Cyan
-Write-Host ""
-Write-Host "Detecting your local network settings..." -ForegroundColor Yellow
+do {
+    # Clear screen and show instructions
+    Clear-Host
+    Write-Host "=====================================================" -ForegroundColor Cyan
+    Write-Host "           NETWORK DIAGNOSTIC TOOL                   " -ForegroundColor Cyan
+    Write-Host "=====================================================" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "Detecting your local network settings..." -ForegroundColor Yellow
 
-# Automatically detect the Default Gateway
-$gateway = (Get-NetRoute -DestinationPrefix "0.0.0.0/0" | Sort-Object RouteMetric | Select-Object -First 1).NextHop
+    # Automatically detect the Default Gateway and active Interface
+    $defaultRoute = Get-NetRoute -DestinationPrefix "0.0.0.0/0" | Sort-Object RouteMetric | Select-Object -First 1
+    $gateway = $defaultRoute.NextHop
 
-if (-not $gateway) {
-    Write-Host "Error: Could not find a Default Gateway. Are you connected to Wi-Fi or Ethernet?" -ForegroundColor Red
-    Pause
-    exit
-}
+    if (-not $gateway) {
+        Write-Host "Error: Could not find a Default Gateway. Are you connected to Wi-Fi or Ethernet?" -ForegroundColor Red
+        Pause
+        exit
+    }
 
-Write-Host "Default Gateway found: $gateway" -ForegroundColor Green
-Write-Host ""
-Write-Host "Running 3 tests simultaneously. This will take about 10-15 seconds..." -ForegroundColor Yellow
-Write-Host " - Test 1: Local Router ($gateway) - 20 pings"
-Write-Host " - Test 2: Internet Connection (8.8.8.8) - 50 pings"
-Write-Host " - Test 3: DNS Resolution (google.com) - 50 pings"
-Write-Host ""
+    # Detect active DNS Servers on the primary interface
+    $dnsServers = (Get-DnsClientServerAddress -InterfaceIndex $defaultRoute.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses
+    if (-not $dnsServers) {
+        $dnsServers = (Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.ServerAddresses.Count -gt 0 } | Select-Object -First 1).ServerAddresses
+    }
+    $dnsServerText = if ($dnsServers) { $dnsServers -join ", " } else { "Auto / Unknown" }
 
-# Function to run pings in background jobs (preserves sequence including timeouts as -1)
-$pingScript = {
-    param($target, $count)
-    $rawSequence = @()
-    $validTimes  = @()
-    $lost = 0
+    Write-Host "Default Gateway found : $gateway" -ForegroundColor Green
+    Write-Host "Active DNS Server(s)  : $dnsServerText" -ForegroundColor Green
+    Write-Host ""
+    Write-Host "Running 3 tests simultaneously. This will take about 10-15 seconds..." -ForegroundColor Yellow
+    Write-Host " - Test 1: Local Router ($gateway) - 20 pings"
+    Write-Host " - Test 2: Internet Connection (8.8.8.8) - 50 pings"
+    Write-Host " - Test 3: DNS Resolution (google.com) - 50 pings"
+    Write-Host ""
 
-    for ($i = 1; $i -le $count; $i++) {
-        $ping = Test-Connection -ComputerName $target -Count 1 -ErrorAction SilentlyContinue
-        if ($ping) {
-            $time = if ($null -ne $ping.ResponseTime) { [int]$ping.ResponseTime } else { [int]$ping.Latency }
-            $validTimes  += $time
-            $rawSequence += $time
-        } else {
-            $lost++
-            $rawSequence += -1 # -1 represents a dropped packet
+    # Function to run pings in background jobs (preserves sequence including timeouts as -1)
+    $pingScript = {
+        param($target, $count)
+        $rawSequence = @()
+        $validTimes  = @()
+        $lost = 0
+
+        for ($i = 1; $i -le $count; $i++) {
+            $ping = Test-Connection -ComputerName $target -Count 1 -ErrorAction SilentlyContinue
+            if ($ping) {
+                $time = if ($null -ne $ping.ResponseTime) { [int]$ping.ResponseTime } else { [int]$ping.Latency }
+                $validTimes  += $time
+                $rawSequence += $time
+            } else {
+                $lost++
+                $rawSequence += -1 # -1 represents a dropped packet
+            }
+            Start-Sleep -Milliseconds 200
         }
-        Start-Sleep -Milliseconds 200
+        
+        $avg = if ($validTimes.Count -gt 0) { [math]::Round(($validTimes | Measure-Object -Average).Average, 1) } else { 0 }
+        $max = if ($validTimes.Count -gt 0) { ($validTimes | Measure-Object -Maximum).Maximum } else { 0 }
+        $lossPct = [math]::Round(($lost / $count) * 100, 1)
+        $spikesOver100 = ($validTimes | Where-Object { $_ -gt 100 }).Count
+
+        return [PSCustomObject]@{
+            Target        = $target
+            Sent          = $count
+            Received      = $validTimes.Count
+            Lost          = $lost
+            LossPct       = $lossPct
+            AvgMs         = $avg
+            MaxMs         = $max
+            SpikesOver100 = $spikesOver100
+            RawSequence   = $rawSequence
+        }
     }
-    
-    $avg = if ($validTimes.Count -gt 0) { [math]::Round(($validTimes | Measure-Object -Average).Average, 1) } else { 0 }
-    $max = if ($validTimes.Count -gt 0) { ($validTimes | Measure-Object -Maximum).Maximum } else { 0 }
-    $lossPct = [math]::Round(($lost / $count) * 100, 1)
 
-    return [PSCustomObject]@{
-        Target      = $target
-        Sent        = $count
-        Received    = $validTimes.Count
-        Lost        = $lost
-        LossPct     = $lossPct
-        AvgMs       = $avg
-        MaxMs       = $max
-        RawSequence = $rawSequence
+    # Start all 3 tests at the exact same time
+    $jobLocal    = Start-Job -ScriptBlock $pingScript -ArgumentList $gateway, 20
+    $jobInternet = Start-Job -ScriptBlock $pingScript -ArgumentList "8.8.8.8", 50
+    $jobDNS      = Start-Job -ScriptBlock $pingScript -ArgumentList "google.com", 50
+
+    # Wait for all 3 jobs to finish while showing a progress spinner
+    $spinner = @('|', '/', '-', '\')
+    $spinIdx = 0
+    while ($jobLocal.State -eq 'Running' -or $jobInternet.State -eq 'Running' -or $jobDNS.State -eq 'Running') {
+        Write-Host -NoNewline "`rTesting in progress... $($spinner[$spinIdx % 4])" -ForegroundColor Cyan
+        $spinIdx++
+        Start-Sleep -Milliseconds 250
     }
-}
+    Write-Host "`rTesting complete!               " -ForegroundColor Green
+    Write-Host ""
 
-# Start all 3 tests at the exact same time
-$jobLocal    = Start-Job -ScriptBlock $pingScript -ArgumentList $gateway, 20
-$jobInternet = Start-Job -ScriptBlock $pingScript -ArgumentList "8.8.8.8", 50
-$jobDNS      = Start-Job -ScriptBlock $pingScript -ArgumentList "google.com", 50
+    # Collect results
+    $resLocal    = Receive-Job -Job $jobLocal
+    $resInternet = Receive-Job -Job $jobInternet
+    $resDNS      = Receive-Job -Job $jobDNS
 
-# Wait for all 3 jobs to finish while showing a progress spinner
-$spinner = @('|', '/', '-', '\')
-$spinIdx = 0
-while ($jobLocal.State -eq 'Running' -or $jobInternet.State -eq 'Running' -or $jobDNS.State -eq 'Running') {
-    Write-Host -NoNewline "`rTesting in progress... $($spinner[$spinIdx % 4])" -ForegroundColor Cyan
-    $spinIdx++
-    Start-Sleep -Milliseconds 250
-}
-Write-Host "`rTesting complete!               " -ForegroundColor Green
-Write-Host ""
+    # Clean up background jobs
+    Remove-Job $jobLocal, $jobInternet, $jobDNS
 
-# Collect results
-$resLocal    = Receive-Job -Job $jobLocal
-$resInternet = Receive-Job -Job $jobInternet
-$resDNS      = Receive-Job -Job $jobDNS
+    # --- Evaluate Individual Tier Statuses, Packet Drops & High Latency Spikes ---
+    $localOk     = -not ($resLocal.Received -eq 0 -or $resLocal.LossPct -gt 10 -or $resLocal.AvgMs -gt 50)
+    $internetOk  = -not ($resInternet.Received -eq 0 -or $resInternet.LossPct -gt 5 -or $resInternet.AvgMs -gt 150)
+    $dnsOk       = -not ($resDNS.Received -eq 0 -or $resDNS.LossPct -gt 5 -or ($resDNS.AvgMs -gt ($resInternet.AvgMs + 80)))
+    $totalLost   = $resLocal.Lost + $resInternet.Lost + $resDNS.Lost
+    $totalSpikes = $resLocal.SpikesOver100 + $resInternet.SpikesOver100 + $resDNS.SpikesOver100
 
-# Clean up background jobs
-Remove-Job $jobLocal, $jobInternet, $jobDNS
-
-# --- Evaluate Individual Tier Statuses for CLI ---
-$localOk    = -not ($resLocal.Received -eq 0 -or $resLocal.LossPct -gt 10 -or $resLocal.AvgMs -gt 50)
-$internetOk = -not ($resInternet.Received -eq 0 -or $resInternet.LossPct -gt 5 -or $resInternet.AvgMs -gt 150)
-$dnsOk      = -not ($resDNS.Received -eq 0 -or $resDNS.LossPct -gt 5 -or ($resDNS.AvgMs -gt ($resInternet.AvgMs + 80)))
-
-# --- Plain-English Diagnostic Logic ---
-$diagnosisTitle = ""
-$diagnosisColor = "#10b981" # Emerald Green
-$diagnosisGlow  = "rgba(16, 185, 129, 0.15)"
-$cliStatusColor = "Green"
-$diagnosisText  = ""
-
-if (-not $localOk) {
-    $diagnosisTitle = "ISSUE DETECTED: Local Network / Wi-Fi Problem"
-    $diagnosisColor = "#ef4444" # Red
-    $diagnosisGlow  = "rgba(239, 68, 68, 0.15)"
-    $cliStatusColor = "Red"
-    $diagnosisText  = "Your computer is struggling to talk to your own router ($gateway). This means the issue is inside your home or office—not with your Internet Service Provider. Try moving closer to your Wi-Fi router, restarting your router, or plugging in an Ethernet cable."
-}
-elseif (-not $internetOk) {
-    $diagnosisTitle = "ISSUE DETECTED: Internet Connection Problem"
-    $diagnosisColor = "#ef4444" # Red
-    $diagnosisGlow  = "rgba(239, 68, 68, 0.15)"
-    $cliStatusColor = "Red"
-    $diagnosisText  = "Your connection to your local router is fine, but data is getting lost or delayed once it leaves your house. This usually points to an outage, heavy congestion, or a bad line with your Internet Service Provider (ISP). Try restarting your modem, or contact your ISP."
-}
-elseif (-not $dnsOk) {
-    $diagnosisTitle = "ISSUE DETECTED: DNS / Website Lookup Problem"
-    $diagnosisColor = "#f59e0b" # Amber
-    $diagnosisGlow  = "rgba(245, 158, 11, 0.15)"
-    $cliStatusColor = "Yellow"
-    $diagnosisText  = "Your raw internet connection is working, but your computer is having trouble translating website names (like google.com) into addresses. Websites may fail to load or take a long time to start loading. Restarting your router or changing your DNS settings (e.g., to 8.8.8.8 or 1.1.1.1) usually fixes this."
-}
-else {
-    $diagnosisTitle = "ALL SYSTEMS HEALTHY!"
+    # --- Plain-English Diagnostic Logic ---
+    $diagnosisTitle = ""
     $diagnosisColor = "#10b981" # Emerald Green
     $diagnosisGlow  = "rgba(16, 185, 129, 0.15)"
     $cliStatusColor = "Green"
-    $diagnosisText  = "Your local network, internet connection, and DNS are all responding normally with low delay and minimal packet loss. If a specific website or game is acting up, the issue is likely on their end, not yours."
-}
+    $diagnosisText  = ""
 
-# --- Display Quick Summary & Diagnosis in PowerShell CLI ---
-Write-Host "=================== QUICK RESULTS ===================" -ForegroundColor Cyan
+    if (-not $localOk) {
+        $diagnosisTitle = "ISSUE DETECTED: Local Network / Wi-Fi Problem"
+        $diagnosisColor = "#ef4444" # Red
+        $diagnosisGlow  = "rgba(239, 68, 68, 0.15)"
+        $cliStatusColor = "Red"
+        $diagnosisText  = "Your computer is struggling to talk to your own router ($gateway). This means the issue is inside your home or office—not with your Internet Service Provider. Try moving closer to your Wi-Fi router, restarting your router, or plugging in an Ethernet cable."
+    }
+    elseif (-not $internetOk) {
+        $diagnosisTitle = "ISSUE DETECTED: Internet Connection Problem"
+        $diagnosisColor = "#ef4444" # Red
+        $diagnosisGlow  = "rgba(239, 68, 68, 0.15)"
+        $cliStatusColor = "Red"
+        $diagnosisText  = "Your connection to your local router is fine, but data is getting lost or delayed once it leaves your house. This usually points to an outage, heavy congestion, or a bad line with your Internet Service Provider (ISP). Try restarting your modem, or contact your ISP."
+    }
+    elseif (-not $dnsOk) {
+        $diagnosisTitle = "ISSUE DETECTED: DNS / Website Lookup Problem"
+        $diagnosisColor = "#f59e0b" # Amber
+        $diagnosisGlow  = "rgba(245, 158, 11, 0.15)"
+        $cliStatusColor = "Yellow"
+        $diagnosisText  = "Your raw internet connection is working, but your computer is having trouble translating website names (like google.com) into addresses using your DNS ($dnsServerText). Restarting your router or changing your DNS settings (e.g., to 8.8.8.8 or 1.1.1.1) usually fixes this."
+    }
+    elseif ($totalLost -gt 0) {
+        $diagnosisTitle = "WARNING: Packet Loss Detected"
+        $diagnosisColor = "#f59e0b" # Amber / Yellow
+        $diagnosisGlow  = "rgba(245, 158, 11, 0.15)"
+        $cliStatusColor = "Yellow"
+        $packetWord     = if ($totalLost -eq 1) { "packet" } else { "packets" }
+        $diagnosisText  = "Your connection dropped $totalLost $packetWord during the test. Even minor packet loss can cause brief audio cutouts, video stutters, or missed inputs in online games. Check the Advanced Report to see whether the drop happened on your Local Wi-Fi, Internet, or DNS."
+    }
+    elseif ($totalSpikes -gt 3) {
+        $diagnosisTitle = "WARNING: No Packet Loss, But High Latency Detected"
+        $diagnosisColor = "#f59e0b" # Amber / Yellow
+        $diagnosisGlow  = "rgba(245, 158, 11, 0.15)"
+        $cliStatusColor = "Yellow"
+        $diagnosisText  = "Your connection isn't dropping data, but $totalSpikes pings spiked over 100 ms during the test. This usually happens when someone else on your network is downloading/streaming heavily, or your internet provider is having issues—which can cause lag spikes in games and video calls. You may want to restart your modem or contact your ISP."
+    }
+    else {
+        $diagnosisTitle = "ALL SYSTEMS HEALTHY!"
+        $diagnosisColor = "#10b981" # Emerald Green
+        $diagnosisGlow  = "rgba(16, 185, 129, 0.15)"
+        $cliStatusColor = "Green"
+        $diagnosisText  = "Your local network, internet connection, and DNS are all responding normally with low delay and zero packet loss. If a specific website or game is acting up, the issue is likely on their end, not yours."
+    }
 
-# Line 1: Local
-Write-Host -NoNewline " 1. Local Router : "
-if ($localOk) { Write-Host -NoNewline "[ GOOD ]  " -ForegroundColor Green } else { Write-Host -NoNewline "[ ISSUE ] " -ForegroundColor Red }
-Write-Host "Avg: $($resLocal.AvgMs) ms | Max: $($resLocal.MaxMs) ms | Loss: $($resLocal.LossPct)%"
+    # --- Display Quick Summary & Diagnosis in PowerShell CLI ---
+    Write-Host "=================== QUICK RESULTS ===================" -ForegroundColor Cyan
 
-# Line 2: Internet
-Write-Host -NoNewline " 2. Internet     : "
-if ($internetOk) { Write-Host -NoNewline "[ GOOD ]  " -ForegroundColor Green } else { Write-Host -NoNewline "[ ISSUE ] " -ForegroundColor Red }
-Write-Host "Avg: $($resInternet.AvgMs) ms | Max: $($resInternet.MaxMs) ms | Loss: $($resInternet.LossPct)%"
+    # Line 1: Local
+    Write-Host -NoNewline " 1. Local Router : "
+    if (-not $localOk) { Write-Host -NoNewline "[ ISSUE ] " -ForegroundColor Red }
+    elseif ($resLocal.Lost -gt 0) { Write-Host -NoNewline "[ LOSS  ] " -ForegroundColor Yellow }
+    elseif ($resLocal.SpikesOver100 -gt 3) { Write-Host -NoNewline "[ SPIKES] " -ForegroundColor Yellow }
+    else { Write-Host -NoNewline "[ GOOD ]  " -ForegroundColor Green }
+    Write-Host "Avg: $($resLocal.AvgMs) ms | Max: $($resLocal.MaxMs) ms | Loss: $($resLocal.LossPct)%"
 
-# Line 3: DNS
-Write-Host -NoNewline " 3. DNS Lookup   : "
-if ($dnsOk) { Write-Host -NoNewline "[ GOOD ]  " -ForegroundColor Green } else { Write-Host -NoNewline "[ ISSUE ] " -ForegroundColor Yellow }
-Write-Host "Avg: $($resDNS.AvgMs) ms | Max: $($resDNS.MaxMs) ms | Loss: $($resDNS.LossPct)%"
+    # Line 2: Internet
+    Write-Host -NoNewline " 2. Internet     : "
+    if (-not $internetOk) { Write-Host -NoNewline "[ ISSUE ] " -ForegroundColor Red }
+    elseif ($resInternet.Lost -gt 0) { Write-Host -NoNewline "[ LOSS  ] " -ForegroundColor Yellow }
+    elseif ($resInternet.SpikesOver100 -gt 3) { Write-Host -NoNewline "[ SPIKES] " -ForegroundColor Yellow }
+    else { Write-Host -NoNewline "[ GOOD ]  " -ForegroundColor Green }
+    Write-Host "Avg: $($resInternet.AvgMs) ms | Max: $($resInternet.MaxMs) ms | Loss: $($resInternet.LossPct)%"
 
-Write-Host "=====================================================" -ForegroundColor Cyan
-Write-Host ""
-Write-Host "STATUS: $diagnosisTitle" -ForegroundColor $cliStatusColor
-Write-Host $diagnosisText -ForegroundColor White
-Write-Host ""
+    # Line 3: DNS
+    Write-Host -NoNewline " 3. DNS Lookup   : "
+    if (-not $dnsOk) { Write-Host -NoNewline "[ ISSUE ] " -ForegroundColor Yellow }
+    elseif ($resDNS.Lost -gt 0) { Write-Host -NoNewline "[ LOSS  ] " -ForegroundColor Yellow }
+    elseif ($resDNS.SpikesOver100 -gt 3) { Write-Host -NoNewline "[ SPIKES] " -ForegroundColor Yellow }
+    else { Write-Host -NoNewline "[ GOOD ]  " -ForegroundColor Green }
+    Write-Host "Avg: $($resDNS.AvgMs) ms | Max: $($resDNS.MaxMs) ms | Loss: $($resDNS.LossPct)%"
+    Write-Host "    DNS Server(s): $dnsServerText" -ForegroundColor DarkGray
 
-# --- Helper Function to Build Mini Sparkline Bar Graphs ---
-function Build-SparklineHtml {
-    param([array]$sequence, [double]$avgMs, [int]$maxMs)
-    $scaleMax = [math]::Max($maxMs, 50)
-    $barsHtml = ""
-    $index = 1
+    Write-Host "=====================================================" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "STATUS: $diagnosisTitle" -ForegroundColor $cliStatusColor
+    Write-Host $diagnosisText -ForegroundColor White
+    Write-Host ""
 
-    foreach ($val in $sequence) {
-        if ($val -lt 0) {
-            $barsHtml += "<div class='bar bar-drop' style='height: 100%;' title='Ping #$index : DROPPED (Timeout)'></div>"
-        } else {
-            $pct = [math]::Max(8, [math]::Round(($val / $scaleMax) * 100))
-            $barClass = "bar-normal"
-            if ($val -gt 150 -or ($avgMs -gt 0 -and $val -gt ($avgMs * 2.5) -and $val -gt 35)) {
-                $barClass = "bar-spike"
-            } elseif ($val -gt 75 -or ($avgMs -gt 0 -and $val -gt ($avgMs * 1.6) -and $val -gt 20)) {
-                $barClass = "bar-warn"
+    # --- Helper Function to Build Mini Sparkline Bar Graphs ---
+    function Build-SparklineHtml {
+        param([array]$sequence, [double]$avgMs, [int]$maxMs)
+        $scaleMax = [math]::Max($maxMs, 50)
+        $barsHtml = ""
+        $index = 1
+
+        foreach ($val in $sequence) {
+            if ($val -lt 0) {
+                $barsHtml += "<div class='bar bar-drop' style='height: 100%;' title='Ping #$index : DROPPED (Timeout)'></div>"
+            } else {
+                $pct = [math]::Max(8, [math]::Round(($val / $scaleMax) * 100))
+                $barClass = "bar-normal"
+                if ($val -gt 100 -or ($avgMs -gt 0 -and $val -gt ($avgMs * 2.5) -and $val -gt 35)) {
+                    $barClass = "bar-spike"
+                } elseif ($val -gt 65 -or ($avgMs -gt 0 -and $val -gt ($avgMs * 1.6) -and $val -gt 20)) {
+                    $barClass = "bar-warn"
+                }
+                $barsHtml += "<div class='bar $barClass' style='height: $pct%;' title='Ping #$index : $val ms'></div>"
             }
-            $barsHtml += "<div class='bar $barClass' style='height: $pct%;' title='Ping #$index : $val ms'></div>"
+            $index++
         }
-        $index++
+        return $barsHtml
     }
-    return $barsHtml
-}
 
-# --- Helper Function to Format Raw Ping List ---
-function Build-RawListHtml {
-    param([array]$sequence)
-    $items = foreach ($val in $sequence) {
-        if ($val -lt 0) {
-            "<span class='timeout-text'>TIMEOUT</span>"
-        } else {
-            "$val"
+    # --- Helper Function to Format Raw Ping List ---
+    function Build-RawListHtml {
+        param([array]$sequence)
+        $items = foreach ($val in $sequence) {
+            if ($val -lt 0) {
+                "<span class='timeout-text'>TIMEOUT</span>"
+            } elseif ($val -gt 100) {
+                "<span class='spike-text'>$val</span>"
+            } else {
+                "$val"
+            }
         }
+        return ($items -join ", ")
     }
-    return ($items -join ", ")
-}
 
-$graphLocal    = Build-SparklineHtml -sequence $resLocal.RawSequence -avgMs $resLocal.AvgMs -maxMs $resLocal.MaxMs
-$graphInternet = Build-SparklineHtml -sequence $resInternet.RawSequence -avgMs $resInternet.AvgMs -maxMs $resInternet.MaxMs
-$graphDNS      = Build-SparklineHtml -sequence $resDNS.RawSequence -avgMs $resDNS.AvgMs -maxMs $resDNS.MaxMs
+    $graphLocal    = Build-SparklineHtml -sequence $resLocal.RawSequence -avgMs $resLocal.AvgMs -maxMs $resLocal.MaxMs
+    $graphInternet = Build-SparklineHtml -sequence $resInternet.RawSequence -avgMs $resInternet.AvgMs -maxMs $resInternet.MaxMs
+    $graphDNS      = Build-SparklineHtml -sequence $resDNS.RawSequence -avgMs $resDNS.AvgMs -maxMs $resDNS.MaxMs
 
-$rawListLocal    = Build-RawListHtml -sequence $resLocal.RawSequence
-$rawListInternet = Build-RawListHtml -sequence $resInternet.RawSequence
-$rawListDNS      = Build-RawListHtml -sequence $resDNS.RawSequence
+    $rawListLocal    = Build-RawListHtml -sequence $resLocal.RawSequence
+    $rawListInternet = Build-RawListHtml -sequence $resInternet.RawSequence
+    $rawListDNS      = Build-RawListHtml -sequence $resDNS.RawSequence
 
-# --- Generate Dark Mode HTML Report ---
-$reportPath = "$env:TEMP\NetworkDiagnosticReport.html"
-$timestamp  = Get-Date -Format "MMMM dd, yyyy 'at' hh:mm tt"
+    # --- Generate Dark Mode HTML Report ---
+    $reportPath = "$env:TEMP\NetworkDiagnosticReport.html"
+    $timestamp  = Get-Date -Format "MMMM dd, yyyy 'at' hh:mm tt"
 
-$html = @"
+    $html = @"
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -318,8 +359,13 @@ $html = @"
             color: var(--text-primary);
             font-weight: 600;
         }
+        .dns-server-tag {
+            font-family: Consolas, monospace;
+            font-size: 0.85rem;
+            color: var(--accent-cyan) !important;
+        }
         .graph-section {
-            margin-top: 16px;
+            margin-top: auto;
             padding-top: 14px;
             border-top: 1px solid var(--border-subtle);
         }
@@ -378,6 +424,10 @@ $html = @"
         }
         .timeout-text {
             color: #f87171;
+            font-weight: bold;
+        }
+        .spike-text {
+            color: #fbbf24;
             font-weight: bold;
         }
 
@@ -475,6 +525,7 @@ $html = @"
                     <h3>3. DNS Lookup</h3>
                     <span class="badge">$($resDNS.Target)</span>
                 </div>
+                <div class="stat"><span>DNS Server(s):</span> <strong class="dns-server-tag">$dnsServerText</strong></div>
                 <div class="stat"><span>Pings Sent / Recv:</span> <strong>$($resDNS.Sent) / $($resDNS.Received)</strong></div>
                 <div class="stat"><span>Packet Loss:</span> <strong>$($resDNS.LossPct)%</strong></div>
                 <div class="stat"><span>Average Latency:</span> <strong>$($resDNS.AvgMs) ms</strong></div>
@@ -494,14 +545,14 @@ $html = @"
             <h3>How to Read These Numbers</h3>
             <ul>
                 <li><strong>Latency (ms):</strong> How fast a signal travels there and back in milliseconds. Lower is better. Under <strong>50 ms</strong> is great; over <strong>150 ms</strong> feels laggy.</li>
-                <li><strong>Look for Latency Spikes:</strong> A healthy connection looks like a flat, steady row of short blue bars. If you see sudden tall yellow or red bars shooting up above the rest (latency spikes), your connection is jittery—this is what causes video calls to freeze, voice chat to cut out, or games to rubber-band even when your average speed looks fine.</li>
+                <li><strong>Look for Latency Spikes:</strong> A healthy connection looks like a flat, steady row of short blue bars. If you see sudden tall yellow or red bars shooting up above the rest (latency spikes over 100 ms), your connection is jittery—this is what causes video calls to freeze, voice chat to cut out, or games to rubber-band even when your average speed looks fine.</li>
                 <li><strong>Highest Latency:</strong> The single worst lag spike recorded during the test.</li>
                 <li><strong>Packet Loss (%):</strong> Percentage of signals that never made it back (shown as striped red bars or <strong>TIMEOUT</strong> in the list). Anything above <strong>0%</strong> indicates an unstable connection.</li>
             </ul>
             <div class="legend">
                 <div class="legend-item"><span class="dot" style="background:#38bdf8;"></span> Normal / Steady</div>
                 <div class="legend-item"><span class="dot" style="background:#fbbf24;"></span> Moderate Jump</div>
-                <div class="legend-item"><span class="dot" style="background:#ef4444;"></span> Latency Spike</div>
+                <div class="legend-item"><span class="dot" style="background:#ef4444;"></span> Latency Spike (&gt;100ms)</div>
                 <div class="legend-item"><span class="dot" style="background:repeating-linear-gradient(45deg,#ef4444,#ef4444 2px,#7f1d1d 2px,#7f1d1d 4px);"></span> Dropped Packet</div>
             </div>
         </div>
@@ -512,9 +563,22 @@ $html = @"
 
 $html | Out-File -FilePath $reportPath -Encoding UTF8
 
-# Prompt the user to open the report
-Write-Host "=====================================================" -ForegroundColor Cyan
-$choice = Read-Host "Press ENTER to view 'Advanced Report' in your web browser (or type N to exit)"
-if ($choice -ne "N" -and $choice -ne "n") {
-    Start-Process $reportPath
-}
+    # Interactive prompt loop for viewing report, retesting, or exiting
+    Write-Host "=====================================================" -ForegroundColor Cyan
+    $retest = $false
+    while ($true) {
+        $choice = Read-Host "Press ENTER for 'Advanced Report', type R to Retest, or N to Exit"
+        if ($choice -eq "R" -or $choice -eq "r") {
+            $retest = $true
+            break
+        }
+        elseif ($choice -eq "N" -or $choice -eq "n") {
+            $retest = $false
+            break
+        }
+        else {
+            Start-Process $reportPath
+            Write-Host "Report opened in your browser! (Type R to Retest or N to Exit)" -ForegroundColor DarkGray
+        }
+    }
+} while ($retest)
