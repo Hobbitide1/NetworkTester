@@ -1,2 +1,8 @@
 # NetworkTester
 A Tool to Test your Local, DNS and Internet Connection. 
+
+# Download
+You can download the exe from here: https://github.com/Hobbitide1/NetworkTester/releases/tag/1
+
+# Note
+Once the file is downloaded, right click the file and check mark unblock so your not getting the "Windows Protected your PC" pop up. 
